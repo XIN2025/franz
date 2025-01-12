@@ -135,6 +135,7 @@ func (s *Server) handleMessage(msg Message) error {
 	if !exists {
 		topic = NewTopic(msg.Topic, s.Config)
 		s.topics[msg.Topic] = topic
+		slog.Info("Created new topic", "topic", msg.Topic)
 	}
 	s.topicsMu.Unlock()
 
@@ -150,32 +151,55 @@ func (s *Server) handleMessage(msg Message) error {
 		Action:    "message",
 		Topics:    []string{msg.Topic},
 		Data:      string(msg.Data),
-		DataRaw:   msg.Data,
 		Success:   true,
 		Partition: partitionID,
 		Offset:    offset,
 	}
 
-	slog.Info("broadcasting message to subscribers",
-		"topic", msg.Topic,
-		"partition", partitionID,
-		"offset", offset,
-		"data", string(msg.Data))
-
-	// Broadcast to subscribers
-	topic.peersMu.RLock()
-	for peerID, peer := range topic.peers {
-		if err := peer.Send(wsMsg); err != nil {
-			slog.Error("failed to send message to peer",
-				"peer_id", peerID,
-				"err", err)
-		} else {
-			slog.Info("sent message to peer",
-				"peer_id", peerID,
-				"topic", msg.Topic)
+	// Distribute to consumer groups
+	s.groupsMu.RLock()
+	for _, group := range s.consumerGroups {
+		group.mutex.RLock()
+		// Check if group is subscribed to this topic
+		if _, ok := group.topics[msg.Topic]; ok {
+			slog.Info("Distributing message to consumer group",
+				"group_id", group.id,
+				"topic", msg.Topic,
+				"partition", partitionID)
+			group.distributeMessage(msg.Topic, partitionID, wsMsg)
 		}
+		group.mutex.RUnlock()
 	}
-	topic.peersMu.RUnlock()
+	s.groupsMu.RUnlock()
+
+	return nil
+}
+
+func (s *Server) routeMessageToTopic(topic *Topic, msg Message) error {
+	partitionID := topic.getPartition(msg.Data)
+	partition := topic.partitions[partitionID]
+
+	offset, err := partition.Push(msg.Data)
+	if err != nil {
+		return fmt.Errorf("failed to store message: %w", err)
+	}
+
+	wsMsg := WSMessage{
+		Action:    "message",
+		Topics:    []string{msg.Topic},
+		Data:      string(msg.Data),
+		Success:   true,
+		Partition: partitionID,
+		Offset:    offset,
+	}
+
+	s.groupsMu.RLock()
+	defer s.groupsMu.RUnlock()
+
+	for _, group := range s.consumerGroups {
+		group.UpdateOffset(msg.Topic, partitionID, offset)
+		group.distributeMessage(msg.Topic, partitionID, wsMsg)
+	}
 
 	return nil
 }
@@ -183,6 +207,8 @@ func (s *Server) handleMessage(msg Message) error {
 func (s *Server) AddPeerToTopics(p Peer, topics ...string) {
 	s.topicsMu.Lock()
 	defer s.topicsMu.Unlock()
+
+	wsPeer, isWSPeer := p.(*WSPeer)
 
 	for _, topicName := range topics {
 		topic, exists := s.topics[topicName]
@@ -197,42 +223,34 @@ func (s *Server) AddPeerToTopics(p Peer, topics ...string) {
 
 		slog.Info("peer added to topic", "peer_id", p.ID(), "topic", topicName)
 
-		// Send historical messages from all partitions
-		for partitionID, partition := range topic.partitions {
-			size := partition.store.Len()
-			if size > 0 {
-				slog.Info("fetching historical messages",
-					"topic", topicName,
-					"partition", partitionID,
-					"message_count", size)
-
-				messages, err := partition.store.GetRange(0, size-1)
-				if err != nil {
-					slog.Error("failed to fetch stored messages", "err", err)
-					continue
-				}
-
-				for _, msg := range messages {
-					wsMsg := WSMessage{
-						Action:    "message",
-						Topics:    []string{topicName},
-						Data:      string(msg.Data),
-						DataRaw:   msg.Data,
-						Success:   true,
-						Partition: partitionID,
-						Offset:    msg.Offset,
+		// For non-consumer group subscribers only
+		if !isWSPeer || wsPeer.consumerGroup == nil {
+			// Send all historical messages
+			for partitionID, partition := range topic.partitions {
+				size := partition.store.Len()
+				if size > 0 {
+					messages, err := partition.store.GetRange(0, size-1)
+					if err != nil {
+						slog.Error("failed to fetch stored messages", "err", err)
+						continue
 					}
 
-					if err := p.Send(wsMsg); err != nil {
-						slog.Error("failed to send historical message",
-							"peer_id", p.ID(),
-							"topic", topicName,
-							"err", err)
-					} else {
-						slog.Info("sent historical message",
-							"peer_id", p.ID(),
-							"topic", topicName,
-							"offset", msg.Offset)
+					for _, msg := range messages {
+						wsMsg := WSMessage{
+							Action:    "message",
+							Topics:    []string{topicName},
+							Data:      string(msg.Data),
+							Success:   true,
+							Partition: partitionID,
+							Offset:    msg.Offset,
+						}
+
+						if err := p.Send(wsMsg); err != nil {
+							slog.Error("failed to send historical message",
+								"peer_id", p.ID(),
+								"topic", topicName,
+								"err", err)
+						}
 					}
 				}
 			}

@@ -57,10 +57,10 @@ func (t *Topic) Push(data []byte) (int, int64, error) {
 	}
 
 	wsMsg := WSMessage{
-		Action:    "message",
-		Topics:    []string{t.name},
-		Data:      string(data),
-		DataRaw:   data,
+		Action: "message",
+		Topics: []string{t.name},
+		Data:   string(data),
+		// DataRaw:   data,
 		Success:   true,
 		Partition: partitionID,
 		Offset:    offset,
