@@ -22,8 +22,10 @@ Gstream is a lightweight data streaming service built in Go that facilitates rea
 ### Installation
 
 1. Clone the repository:
-```git clone https://github.com/yourusername/gstream.git
 ```
-```cd gstream
+git clone https://github.com/yourusername/gstream.git
+```
+```
+cd gstream
 ```
 2. Build the project:
