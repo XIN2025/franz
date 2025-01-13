@@ -31,14 +31,14 @@ type WSPeer struct {
 	closed               atomic.Bool
 	messageCount         atomic.Int64
 	consumerGroup        *ConsumerGroup
-	assignedPartitions   map[string][]int // topic -> partitions
+	assignedPartitions   map[string][]int
 	assignedPartitionsMu sync.RWMutex
-	debugID              string // Short ID for logging
+	debugID              string
 }
 
 func NewWSPeer(conn *websocket.Conn, s *Server) *WSPeer {
 	fullID := generateID()
-	shortID := fullID[:8] // Use first 8 chars for readable logging
+	shortID := fullID[:8]
 	p := &WSPeer{
 		conn:               conn,
 		server:             s,
@@ -59,8 +59,10 @@ func (p *WSPeer) GetMessageCount() int64 {
 
 func (p *WSPeer) readLoop() {
 	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("Recovered from panic in readLoop", "peer_id", p.id, "panic", r)
+		}
 		p.Close()
-		close(p.stopCh)
 	}()
 
 	for {
@@ -91,7 +93,6 @@ func (p *WSPeer) handleMessage(msg WSMessage) error {
 
 	switch msg.Action {
 	case "subscribe":
-		// Update peer's topics before joining group
 		p.topicsMu.Lock()
 		for _, topic := range msg.Topics {
 			p.topics[topic] = struct{}{}
@@ -187,7 +188,14 @@ func (p *WSPeer) Close() error {
 	}
 	p.topicsMu.Unlock()
 
-	close(p.stopCh)
+	// Only close stopCh if it hasn't been closed yet
+	select {
+	case <-p.stopCh:
+		// Channel is already closed
+	default:
+		close(p.stopCh)
+	}
+
 	return p.conn.Close()
 }
 

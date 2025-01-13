@@ -16,7 +16,7 @@ type ConsumerGroup struct {
 	partitionOwners map[string]map[int]string
 	rebalanceMu     sync.RWMutex
 	server          *Server
-	topics          map[string]struct{} // Track subscribed topics
+	topics          map[string]struct{}
 }
 
 func NewConsumerGroup(id string, server *Server) *ConsumerGroup {
@@ -33,7 +33,6 @@ func NewConsumerGroup(id string, server *Server) *ConsumerGroup {
 func (g *ConsumerGroup) RemoveMember(peerID string) {
 	g.mutex.Lock()
 	if _, exists := g.members[peerID]; exists {
-		// Clear partition assignments for the leaving member
 		g.rebalanceMu.Lock()
 		for topic, partitions := range g.partitionOwners {
 			for partition, owner := range partitions {
@@ -49,22 +48,21 @@ func (g *ConsumerGroup) RemoveMember(peerID string) {
 	}
 	g.mutex.Unlock()
 
-	// Trigger rebalance for all topics
-	for topic := range g.offsets {
-		partitionCount := len(g.offsets[topic])
-		if partitionCount > 0 {
-			g.rebalancePartitions(topic, partitionCount)
-		}
-	}
-}
+	remainingMembers := g.getActiveMembers()
 
-func contains(slice []string, item string) bool {
-	for _, s := range slice {
-		if s == item {
-			return true
+	if len(remainingMembers) > 0 {
+		slog.Info("Rebalancing after member removal",
+			"removed_member", peerID,
+			"remaining_members", len(remainingMembers))
+
+		g.rebalancePartitionsForAllTopics()
+
+		for topic := range g.topics {
+			g.notifyConsumersOfAssignments(topic)
 		}
+	} else {
+		slog.Info("No remaining members in consumer group", "group_id", g.id)
 	}
-	return false
 }
 
 // Add helper method to get partition store
@@ -75,18 +73,6 @@ func (g *ConsumerGroup) getPartitionStore(topic string, partition int) (Storer, 
 		}
 	}
 	return nil, fmt.Errorf("partition store not found")
-}
-
-func (g *ConsumerGroup) getPartitionOwner(topic string, partition int) string {
-	g.rebalanceMu.RLock()
-	defer g.rebalanceMu.RUnlock()
-
-	if topicPartitions, exists := g.partitionOwners[topic]; exists {
-		if owner, exists := topicPartitions[partition]; exists {
-			return owner
-		}
-	}
-	return ""
 }
 
 func (g *ConsumerGroup) rebalancePartitions(topic string, numPartitions int) {
@@ -105,11 +91,12 @@ func (g *ConsumerGroup) rebalancePartitions(topic string, numPartitions int) {
 		return
 	}
 
+	g.partitionOwners[topic] = make(map[int]string)
+
 	partitionsPerConsumer := numPartitions / len(members)
 	extraPartitions := numPartitions % len(members)
 	currentPartition := 0
 
-	g.partitionOwners[topic] = make(map[int]string) // Clear existing assignments
 	for i, memberID := range members {
 		numPartitionsForMember := partitionsPerConsumer
 		if i < extraPartitions {
@@ -118,7 +105,10 @@ func (g *ConsumerGroup) rebalancePartitions(topic string, numPartitions int) {
 
 		for j := 0; j < numPartitionsForMember && currentPartition < numPartitions; j++ {
 			g.partitionOwners[topic][currentPartition] = memberID
-			slog.Info("Partition assigned", "topic", topic, "partition", currentPartition, "owner", memberID)
+			slog.Info("Partition assigned",
+				"topic", topic,
+				"partition", currentPartition,
+				"owner", memberID)
 			currentPartition++
 		}
 	}
@@ -181,7 +171,6 @@ func (g *ConsumerGroup) AddMember(peer Peer) {
 		return
 	}
 
-	// Subscribe to topics
 	wsPeer.topicsMu.RLock()
 	topics := make([]string, 0, len(wsPeer.topics))
 	for topic := range wsPeer.topics {
@@ -189,26 +178,21 @@ func (g *ConsumerGroup) AddMember(peer Peer) {
 	}
 	wsPeer.topicsMu.RUnlock()
 
-	// Add topics to group tracking
 	g.mutex.Lock()
 	for _, topic := range topics {
 		g.topics[topic] = struct{}{}
 
-		// Initialize offsets map if not exists
 		if _, exists := g.offsets[topic]; !exists {
 			g.offsets[topic] = make(map[int]int64)
 		}
 
-		// Initialize partition owners if not exists
 		if _, exists := g.partitionOwners[topic]; !exists {
 			g.partitionOwners[topic] = make(map[int]string)
 		}
 	}
 	g.mutex.Unlock()
 
-	// Trigger rebalance and assignments
 	for _, topic := range topics {
-		// Get partition count for topic
 		g.server.topicsMu.RLock()
 		t, exists := g.server.topics[topic]
 		partitionCount := 0
@@ -223,7 +207,6 @@ func (g *ConsumerGroup) AddMember(peer Peer) {
 		}
 	}
 
-	// Send subscription confirmation
 	wsMsg := WSMessage{
 		Action:        "subscribed",
 		ConsumerGroup: g.id,
@@ -234,39 +217,9 @@ func (g *ConsumerGroup) AddMember(peer Peer) {
 		slog.Error("Failed to send subscription confirmation", "peer_id", peer.ID(), "err", err)
 	}
 
-	// Send historical messages for assigned partitions
 	for _, topic := range topics {
 		g.sendHistoricalMessagesToMember(wsPeer, topic)
 	}
-}
-func (g *ConsumerGroup) sendHistoricalMessagesForTopic(peer *WSPeer, topic string) {
-	g.rebalanceMu.RLock()
-	owners := g.partitionOwners[topic]
-	g.rebalanceMu.RUnlock()
-
-	assignedPartitions := make([]int, 0)
-	for partition, owner := range owners {
-		if owner == peer.ID() {
-			assignedPartitions = append(assignedPartitions, partition)
-		}
-	}
-
-	for _, partition := range assignedPartitions {
-		g.sendHistoricalMessages(peer, topic, partition)
-	}
-}
-
-func (g *ConsumerGroup) isPartitionOwner(topic string, partition int, peerID string) bool {
-	g.rebalanceMu.RLock()
-	defer g.rebalanceMu.RUnlock()
-
-	owners, exists := g.partitionOwners[topic]
-	if !exists {
-		return false
-	}
-
-	owner, ok := owners[partition]
-	return ok && owner == peerID
 }
 
 func (g *ConsumerGroup) getActiveMembers() []string {
@@ -291,69 +244,6 @@ func (g *ConsumerGroup) rebalancePartitionsForAllTopics() {
 	for _, topic := range topics {
 		partitionCount := len(g.server.topics[topic].partitions)
 		g.rebalancePartitions(topic, partitionCount)
-	}
-}
-
-func (g *ConsumerGroup) handleSubscribe(peer *WSPeer, topics []string) {
-	slog.Info("Handling subscription", "peer_id", peer.ID(), "topics", topics)
-
-	// Initialize group's topic tracking
-	g.mutex.Lock()
-	for _, topic := range topics {
-		g.topics[topic] = struct{}{}
-
-		// Initialize offsets if not exists
-		if _, exists := g.offsets[topic]; !exists {
-			g.offsets[topic] = make(map[int]int64)
-		}
-	}
-	g.mutex.Unlock()
-
-	// Update peer's topics
-	peer.topicsMu.Lock()
-	for _, topic := range topics {
-		peer.topics[topic] = struct{}{}
-	}
-	peer.topicsMu.Unlock()
-
-	// Handle each topic
-	for _, topic := range topics {
-		// Ensure topic exists and get partition count
-		g.server.topicsMu.Lock()
-		t, exists := g.server.topics[topic]
-		if !exists {
-			t = NewTopic(topic, g.server.Config)
-			g.server.topics[topic] = t
-		}
-		partitionCount := len(t.partitions)
-		g.server.topicsMu.Unlock()
-
-		// Initialize partition owners if not exists
-		g.rebalanceMu.Lock()
-		if _, exists := g.partitionOwners[topic]; !exists {
-			g.partitionOwners[topic] = make(map[int]string)
-		}
-		g.rebalanceMu.Unlock()
-
-		// Trigger rebalance
-		g.rebalancePartitions(topic, partitionCount)
-
-		// Send partition assignments to all members
-		g.notifyConsumersOfAssignments(topic)
-
-		// Send historical messages for this topic to the new member
-		g.sendHistoricalMessagesToMember(peer, topic)
-	}
-
-	// Send subscription confirmation
-	wsMsg := WSMessage{
-		Action:        "subscribed",
-		ConsumerGroup: g.id,
-		Topics:        topics,
-		Success:       true,
-	}
-	if err := peer.Send(wsMsg); err != nil {
-		slog.Error("Failed to send subscription confirmation", "peer_id", peer.ID(), "err", err)
 	}
 }
 

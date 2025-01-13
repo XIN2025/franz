@@ -156,11 +156,9 @@ func (s *Server) handleMessage(msg Message) error {
 		Offset:    offset,
 	}
 
-	// Distribute to consumer groups
 	s.groupsMu.RLock()
 	for _, group := range s.consumerGroups {
 		group.mutex.RLock()
-		// Check if group is subscribed to this topic
 		if _, ok := group.topics[msg.Topic]; ok {
 			slog.Info("Distributing message to consumer group",
 				"group_id", group.id,
@@ -171,35 +169,6 @@ func (s *Server) handleMessage(msg Message) error {
 		group.mutex.RUnlock()
 	}
 	s.groupsMu.RUnlock()
-
-	return nil
-}
-
-func (s *Server) routeMessageToTopic(topic *Topic, msg Message) error {
-	partitionID := topic.getPartition(msg.Data)
-	partition := topic.partitions[partitionID]
-
-	offset, err := partition.Push(msg.Data)
-	if err != nil {
-		return fmt.Errorf("failed to store message: %w", err)
-	}
-
-	wsMsg := WSMessage{
-		Action:    "message",
-		Topics:    []string{msg.Topic},
-		Data:      string(msg.Data),
-		Success:   true,
-		Partition: partitionID,
-		Offset:    offset,
-	}
-
-	s.groupsMu.RLock()
-	defer s.groupsMu.RUnlock()
-
-	for _, group := range s.consumerGroups {
-		group.UpdateOffset(msg.Topic, partitionID, offset)
-		group.distributeMessage(msg.Topic, partitionID, wsMsg)
-	}
 
 	return nil
 }
