@@ -1,4 +1,4 @@
-# README for Franz: A Data Streaming Service
+#Franz: A Data Streaming Service
 
 ## Overview
 
